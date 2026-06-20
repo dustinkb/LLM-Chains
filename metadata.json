@@ -1,0 +1,6 @@
+{
+  "name": "LLM Chain Processor",
+  "description": "An orchestration tool for multi-stage language model prompt chains, supporting Gemini, OpenRouter, and local Ollama.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
