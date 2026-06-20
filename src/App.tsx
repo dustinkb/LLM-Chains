@@ -33,7 +33,8 @@ import {
   Pin,
   PinOff,
   History,
-  GitCompare
+  GitCompare,
+  FileText
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import {
@@ -215,6 +216,10 @@ export default function App() {
     return localStorage.getItem("llm-chain-openrouter-key") || "";
   });
 
+  const [customGeminiApiKey, setCustomGeminiApiKey] = useState<string>(() => {
+    return localStorage.getItem("llm-chain-gemini-key") || "";
+  });
+
   // Ollama local connectivity tags
   const [ollamaModels, setOllamaModels] = useState<{ id: string; name: string }[]>([]);
   const [isOllamaSearching, setIsOllamaSearching] = useState<boolean>(false);
@@ -240,6 +245,8 @@ export default function App() {
   const [generalToast, setGeneralToast] = useState<{ type: "success" | "error" | "info"; msg: string } | null>(null);
   const [historyGalleryStageId, setHistoryGalleryStageId] = useState<string | null>(null);
   const [showDiffStageIds, setShowDiffStageIds] = useState<Record<string, boolean>>({});
+  const [showConsolidatedReport, setShowConsolidatedReport] = useState<boolean>(false);
+  const [autoOpenReportOnSuccess, setAutoOpenReportOnSuccess] = useState<boolean>(true);
 
   // Abort controllers for running streams
   const activeAbortControllers = useRef<Record<string, AbortController>>({});
@@ -835,14 +842,20 @@ export default function App() {
     }
   };
 
-  const runStageSingle = async (stageId: string, index: number, isChainRun = false): Promise<string> => {
+  const runStageSingle = async (
+    stageId: string,
+    index: number,
+    isChainRun = false,
+    latestOutputsMap?: Record<string, string>
+  ): Promise<string> => {
     const targetStage = activeChain.stages[index];
     if (!targetStage) return "";
 
     // If locked and has existing value, preserve & quickly return output
-    if (targetStage.settings.lockOutput && targetStage.output && !isChainRun) {
+    const existingOutput = latestOutputsMap ? latestOutputsMap[stageId] : targetStage.output;
+    if (targetStage.settings.lockOutput && existingOutput && !isChainRun) {
       triggerToast("info", `Skipped stage ${index} as it is locked.`);
-      return targetStage.output;
+      return existingOutput;
     }
 
     // Determine correct context: output of stage i-1
@@ -853,13 +866,17 @@ export default function App() {
     }
 
     let upstreamContent = "";
-    if (upstreamStage.id === "stage-0") {
+    if (upstreamStage.id === "stage-0" || index - 1 === 0) {
       upstreamContent = upstreamStage.prompt;
     } else {
-      const pinned = upstreamStage.pinnedVersionId && upstreamStage.outputs
-        ? upstreamStage.outputs.find(o => o.id === upstreamStage.pinnedVersionId)
-        : null;
-      upstreamContent = pinned ? pinned.content : upstreamStage.output;
+      if (latestOutputsMap && latestOutputsMap[upstreamStage.id] !== undefined) {
+        upstreamContent = latestOutputsMap[upstreamStage.id];
+      } else {
+        const pinned = upstreamStage.pinnedVersionId && upstreamStage.outputs
+          ? upstreamStage.outputs.find(o => o.id === upstreamStage.pinnedVersionId)
+          : null;
+        upstreamContent = pinned ? pinned.content : upstreamStage.output;
+      }
     }
 
     // Resolve which model to focus on: stage override or global workspace fallback
@@ -960,7 +977,8 @@ export default function App() {
             prompt: targetStage.prompt,
             temperature: targetStage.settings.temperature,
             topP: targetStage.settings.topP,
-            openRouterApiKey: chosenEngine === "openrouter" ? openRouterApiKey : undefined
+            openRouterApiKey: chosenEngine === "openrouter" ? openRouterApiKey : undefined,
+            customGeminiApiKey: chosenEngine === "gemini" ? customGeminiApiKey : undefined
           })
         });
 
@@ -1047,15 +1065,24 @@ export default function App() {
 
     triggerToast("info", "Starting sequential pipeline orchestration run...");
 
+    // Initialize fresh local tracking lookup to overcome React closure limitations (stale states during sequential await loop)
+    const latestOutputs: Record<string, string> = {};
+    activeChain.stages.forEach((stg, sIndex) => {
+      if (stg.id === "stage-0" || sIndex === 0) {
+        latestOutputs[stg.id] = stg.prompt || "";
+      } else {
+        latestOutputs[stg.id] = stg.output || "";
+      }
+    });
+
     // Iterate through Stage 1..N
-    // Keep local tracks of outputs because state batches might not update immediately
     let prevSuccess = true;
 
     for (let idx = 1; idx < activeChain.stages.length; idx++) {
       const currentStage = activeChain.stages[idx];
 
       // If output lock is checked and we already have outputs, we gracefully preserve it
-      if (currentStage.settings.lockOutput && currentStage.output) {
+      if (currentStage.settings.lockOutput && latestOutputs[currentStage.id]) {
         setStageStatuses(prev => ({ ...prev, [currentStage.id]: "complete" }));
         continue;
       }
@@ -1065,15 +1092,22 @@ export default function App() {
         continue;
       }
 
-      // Run and wait blockingly
-      const output = await runStageSingle(currentStage.id, idx, true);
+      // Run and wait blockingly with the custom context lookup map
+      const output = await runStageSingle(currentStage.id, idx, true, latestOutputs);
       if (!output || output.startsWith("[ERROR]")) {
         prevSuccess = false;
+      } else {
+        // Record output immediately for subsequent downstream sequential stages
+        latestOutputs[currentStage.id] = output;
       }
     }
 
     if (prevSuccess) {
       triggerToast("success", "Sequential pipeline chain execution complete.");
+      // Auto-reveal the Consolidated Outputs Summary View
+      if (autoOpenReportOnSuccess) {
+        setShowConsolidatedReport(true);
+      }
     } else {
       triggerToast("error", "Sequential run halted due to stage failure.");
     }
@@ -1294,7 +1328,7 @@ export default function App() {
                   </span>
                   <button
                     onClick={() => setShowApiKeySetting(!showApiKeySetting)}
-                    className="text-[10px] text-text-muted hover:text-text-primary font-mono"
+                    className="text-[10px] text-text-muted hover:text-text-primary font-mono cursor-pointer"
                   >
                     {showApiKeySetting ? "Hide" : "Show"}
                   </button>
@@ -1310,6 +1344,37 @@ export default function App() {
                   className="w-full text-xs font-mono p-2 rounded-lg bg-bg-tertiary border border-border-theme text-text-primary outline-none focus:border-text-primary/40"
                 />
                 <p className="text-[9px] text-text-muted mt-1.5 leading-normal">API Keys are securely stored only inside local storage.</p>
+              </div>
+            )}
+
+            {/* Dynamic Gemini key registration field */}
+            {globalEngine === "gemini" && (
+              <div className="mb-4 p-3 rounded-xl border border-border-theme bg-bg-secondary">
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-[11px] text-text-secondary flex items-center gap-1">
+                    <Key size={12} />
+                    Gemini Key (Optional)
+                  </span>
+                  <button
+                    onClick={() => setShowApiKeySetting(!showApiKeySetting)}
+                    className="text-[10px] text-text-muted hover:text-text-primary font-mono cursor-pointer"
+                  >
+                    {showApiKeySetting ? "Hide" : "Show"}
+                  </button>
+                </div>
+                <input
+                  type={showApiKeySetting ? "text" : "password"}
+                  placeholder="AIzaSy..."
+                  value={customGeminiApiKey}
+                  onChange={(e) => {
+                    setCustomGeminiApiKey(e.target.value);
+                    localStorage.setItem("llm-chain-gemini-key", e.target.value);
+                  }}
+                  className="w-full text-xs font-mono p-2 rounded-lg bg-bg-tertiary border border-border-theme text-text-primary outline-none focus:border-text-primary/40"
+                />
+                <p className="text-[9px] text-text-muted mt-1.5 leading-normal">
+                  Pasting your own Gemini API key (free from Google AI Studio) overrides the system workspace limit.
+                </p>
               </div>
             )}
 
@@ -1545,7 +1610,27 @@ export default function App() {
               />
             </div>
 
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center gap-3">
+              {/* Auto open report on completion option */}
+              <label className="flex items-center gap-1.5 text-[10px] uppercase font-bold text-text-muted cursor-pointer hover:text-text-secondary transition-colors shrink-0 mr-1 select-none">
+                <input
+                  type="checkbox"
+                  checked={autoOpenReportOnSuccess}
+                  onChange={(e) => setAutoOpenReportOnSuccess(e.target.checked)}
+                  className="rounded border-border-theme focus:ring-0 accent-text-primary w-3.5 h-3.5 cursor-pointer"
+                />
+                Auto-open Report
+              </label>
+
+              <button
+                onClick={() => setShowConsolidatedReport(true)}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-border-theme bg-bg-primary text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors cursor-pointer"
+                title="View reports of all active stages in a unified layout"
+              >
+                <FileText size={13} />
+                Consolidated Report
+              </button>
+
               <button
                 onClick={handleAddBlankStage}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-border-theme bg-bg-primary text-text-primary hover:bg-bg-hover cursor-pointer"
@@ -1570,6 +1655,60 @@ export default function App() {
               </button>
             </div>
           </div>
+
+          {/* Dynamic Warning Block / Helpful instructions for standard rate limits */}
+          {(() => {
+            const hasQuotaError = activeChain.stages.some(stg => stg.output && (stg.output.includes("RESOURCE_EXHAUSTED") || stg.output.includes("Quota exceeded") || stg.output.includes("Too Many Requests") || stg.output.includes("(429)")));
+            
+            if (hasQuotaError) {
+              return (
+                <div className="rounded-2xl border border-red-500/20 bg-red-500/5 p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 animate-fade-in">
+                  <div className="space-y-1">
+                    <p className="text-xs font-bold text-red-400 uppercase tracking-wide flex items-center gap-1.5">
+                      ⚠️ Gemini API Rate Limit (429) Encountered
+                    </p>
+                    <p className="text-[11px] text-text-secondary leading-relaxed">
+                      The sandbox sharing key is hit with multiple requests. You can bypass this quota block immediately by inserting your own **free** API Key from Google AI Studio in the sidebar settings.
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => {
+                      setGlobalEngine("gemini");
+                      setShowApiKeySetting(true);
+                      triggerToast("info", "Please paste your free Google AI Studio key inside 'Gemini Key (Optional)' below.");
+                    }}
+                    className="px-3 py-1.5 rounded-lg text-[10px] uppercase font-bold font-mono bg-red-500/20 text-red-300 border border-red-500/30 hover:bg-red-500/30 shrink-0 cursor-pointer"
+                  >
+                    Configure Key Now
+                  </button>
+                </div>
+              );
+            }
+
+            // Always display a subtle, super-slick helper ribbon for smooth workspace operations
+            return (
+              <div className="rounded-xl border border-border-theme bg-bg-secondary p-3 text-[11px] flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-text-secondary">
+                <span className="flex items-center gap-2">
+                  <span className="flex h-1.5 w-1.5 relative">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500"></span>
+                  </span>
+                  <span>
+                    Workspace optimized. Set a custom **Gemini Key** in the sidebar to bypass shared sandbox daily limits.
+                  </span>
+                </span>
+                <button
+                  onClick={() => {
+                    setGlobalEngine("gemini");
+                    setShowApiKeySetting(true);
+                  }}
+                  className="text-[10px] text-text-muted hover:text-text-primary underline font-mono cursor-pointer bg-none border-none p-0"
+                >
+                  Configure
+                </button>
+              </div>
+            );
+          })()}
 
           {/* Sequential visual node iteration */}
           <div className="relative flex flex-col gap-0">
@@ -2209,6 +2348,161 @@ export default function App() {
           </div>
         );
       })()}
+
+      {/* CONSOLIDATED STAGE OUTPUTS REPORT MODAL */}
+      {showConsolidatedReport && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/85 backdrop-blur-sm animate-fade-in text-text-primary">
+          <div className="w-full max-w-5xl h-[85vh] bg-bg-secondary border border-border-theme rounded-2xl flex flex-col overflow-hidden shadow-2xl relative">
+            
+            {/* Header */}
+            <div className="flex items-center justify-between px-6 py-4 bg-bg-tertiary border-b border-border-theme shrink-0 animate-fade-in">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-text-primary/10 text-text-primary flex items-center justify-center border border-border-theme">
+                  <FileText size={16} />
+                </div>
+                <div>
+                  <h2 className="text-sm font-bold text-text-primary uppercase tracking-wider">Consolidated Outputs Report</h2>
+                  <p className="text-[10px] text-text-muted font-mono uppercase tracking-wide">
+                    Unified compilation for workspace worksheet: <span className="text-text-secondary font-bold font-sans">{activeChain.name}</span>
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => {
+                    const completeReport = activeChain.stages
+                      .filter((s, idx) => idx > 0) // exclude root seed input stage
+                      .map((s, idx) => `## Stage ${idx + 1}: Prompt Strategy\n${s.output || "[Pending generation]"}`)
+                      .join("\n\n---\n\n");
+                    navigator.clipboard.writeText(completeReport);
+                    triggerToast("success", "Compiled pipeline report copied successfully.");
+                  }}
+                  className="px-3 py-1.5 rounded-lg text-xs font-bold bg-text-primary text-bg-primary hover:opacity-90 transition-all cursor-pointer uppercase tracking-wide flex items-center gap-1.5 shadow-md"
+                >
+                  <Copy size={11} />
+                  Copy Compiled Report
+                </button>
+
+                <button
+                  onClick={() => {
+                    const completeReport = activeChain.stages
+                      .filter((s, idx) => idx > 0)
+                      .map((s, idx) => `## Stage ${idx + 1}: Prompt Strategy\n${s.output || "[Pending generation]"}`)
+                      .join("\n\n---\n\n");
+                    const blob = new Blob([completeReport], { type: "text/markdown;charset=utf-8;" });
+                    const url = URL.createObjectURL(blob);
+                    const link = document.createElement("a");
+                    link.href = url;
+                    link.setAttribute("download", `${activeChain.name.toLowerCase().replace(/\s+/g, "_")}_consolidated_report.md`);
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                    triggerToast("success", "Markdown report file download initialized.");
+                  }}
+                  className="px-3 py-1.5 rounded-lg text-xs font-bold bg-bg-primary hover:bg-bg-hover border border-border-theme text-text-secondary hover:text-text-primary transition-all cursor-pointer uppercase tracking-wide flex items-center gap-1.5 font-mono"
+                >
+                  <Download size={11} />
+                  Download .MD
+                </button>
+
+                <button
+                  onClick={() => setShowConsolidatedReport(false)}
+                  className="px-3 py-1.5 rounded-lg text-xs font-bold bg-bg-primary hover:bg-bg-hover border border-border-theme text-text-muted hover:text-text-primary transition-all cursor-pointer uppercase tracking-wide"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+
+            {/* List / Scroll Area of Stage outputs side by side or stacked */}
+            <div className="flex-1 overflow-y-auto p-6 space-y-6 bg-bg-primary custom-scrollbar select-text selection:bg-purple-500/20">
+              {activeChain.stages.filter((_, idx) => idx > 0).length === 0 ? (
+                <div className="h-64 flex flex-col items-center justify-center text-text-muted">
+                  <FileText size={48} className="stroke-1 opacity-20 mb-3" />
+                  <p className="text-sm italic">No stages exist in this workspace to consolidate outputs for.</p>
+                </div>
+              ) : (
+                activeChain.stages
+                  .filter((_, idx) => idx > 0) // exclude seed node
+                  .map((stage, filteredIdx) => {
+                    const actualIdx = filteredIdx + 1;
+                    const status = stageStatuses[stage.id] || "idle";
+
+                    return (
+                      <div
+                        key={stage.id}
+                        className="rounded-xl border border-border-theme bg-bg-secondary p-5 space-y-3 shadow-lg relative group transition-all"
+                      >
+                        {/* Stage subheader info */}
+                        <div className="flex items-center justify-between border-b border-border-theme pb-2.5 shrink-0">
+                          <div className="flex items-center gap-2">
+                            <span className="w-5 h-5 rounded bg-text-primary/10 text-text-primary text-[10px] font-bold flex items-center justify-center">
+                              {actualIdx}
+                            </span>
+                            <span className="text-xs font-bold text-text-primary uppercase tracking-wide font-sans">
+                              Stage {actualIdx}: Prompt Strategy
+                            </span>
+                            <span className="text-[9px] font-mono text-text-muted">
+                              ({stage.settings.model || activeChain.model || "gemini-3.5-flash"})
+                            </span>
+                          </div>
+
+                          <div className="flex items-center gap-1.5">
+                            <span className={`px-1.5 py-0.5 rounded text-[8px] font-bold font-mono uppercase tracking-wider border ${
+                              status === "processing" ? "bg-yellow-500/10 border-yellow-500/20 text-yellow-500 animate-pulse" :
+                              status === "complete" ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-400" :
+                              status === "issue" ? "bg-red-500/10 border-red-500/20 text-red-500" :
+                              status === "stopped" ? "bg-neutral-500/10 border-neutral-500/20 text-neutral-400" :
+                              "bg-text-primary/5 border-border-theme text-text-muted"
+                            }`}>
+                              {status}
+                            </span>
+
+                            {stage.output && (
+                              <button
+                                onClick={() => {
+                                  navigator.clipboard.writeText(stage.output);
+                                  triggerToast("success", `Stage ${actualIdx} output copied.`);
+                                }}
+                                className="p-1 rounded text-text-muted hover:text-text-primary transition-colors cursor-pointer"
+                                title="Copy this stage output only"
+                              >
+                                <Copy size={11} />
+                              </button>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Prompt instructions preview small */}
+                        <div className="text-[10px] text-text-muted font-sans italic bg-bg-tertiary px-3 py-1.5 rounded-lg border border-border-theme flex flex-col gap-0.5">
+                          <span className="font-bold uppercase tracking-wider text-[8px] text-text-muted/70 block">Prompt Directions Context</span>
+                          <span className="line-clamp-2">{stage.prompt}</span>
+                        </div>
+
+                        {/* Large scrollable text box of generated results */}
+                        <div className="p-4 rounded-lg bg-bg-tertiary font-mono text-xs text-text-secondary border border-border-theme max-h-60 overflow-y-auto whitespace-pre-wrap select-text selection:bg-text-primary/20 custom-scrollbar">
+                          {stage.output || (
+                            <span className="text-text-muted italic">
+                              {status === "processing" ? "Generating streaming content..." : "Awaiting runner trigger..."}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })
+              )}
+            </div>
+
+            {/* Bottom summary and indicators */}
+            <div className="px-6 py-3 bg-bg-tertiary border-t border-border-theme flex items-center justify-between shrink-0 text-[10px] text-text-muted font-mono uppercase tracking-widest font-bold">
+              <span>Total Pipeline Stages: {activeChain.stages.length - 1}</span>
+              <span>All outputs consolidated above</span>
+            </div>
+
+          </div>
+        </div>
+      )}
 
     </div>
   );

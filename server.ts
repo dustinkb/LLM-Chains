@@ -12,23 +12,19 @@ const PORT = 3000;
 app.use(express.json());
 
 // Initialize Gemini SDK lazily to avoid crashing on start if API key is blank
-let aiClient: GoogleGenAI | null = null;
-function getGeminiClient(): GoogleGenAI {
-  if (!aiClient) {
-    const key = process.env.GEMINI_API_KEY;
-    if (!key) {
-      throw new Error("GEMINI_API_KEY is not defined in the environment secrets.");
-    }
-    aiClient = new GoogleGenAI({
-      apiKey: key,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        }
-      }
-    });
+function getGeminiClient(customKey?: string): GoogleGenAI {
+  const finalKey = customKey || process.env.GEMINI_API_KEY;
+  if (!finalKey) {
+    throw new Error("GEMINI_API_KEY is not defined. Please configure a custom Gemini API Key in the sidebar or provide it in environment secrets.");
   }
-  return aiClient;
+  return new GoogleGenAI({
+    apiKey: finalKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      }
+    }
+  });
 }
 
 // 1. Health check routing
@@ -71,7 +67,7 @@ app.get("/api/models/openrouter", async (req: Request, res: Response) => {
 
 // 3. Sequential Stage Executable SSE Endpoint
 app.post("/api/run-chain-step", async (req: Request, res: Response) => {
-  const { engine, model, systemInstruction, prompt, temperature, topP, openRouterApiKey } = req.body;
+  const { engine, model, systemInstruction, prompt, temperature, topP, openRouterApiKey, customGeminiApiKey } = req.body;
 
   // Configure SSE standard headers
   res.setHeader("Content-Type", "text/event-stream");
@@ -80,7 +76,7 @@ app.post("/api/run-chain-step", async (req: Request, res: Response) => {
 
   try {
     if (engine === "gemini") {
-      const ai = getGeminiClient();
+      const ai = getGeminiClient(customGeminiApiKey);
       const responseStream = await ai.models.generateContentStream({
         model: model || "gemini-3.5-flash",
         contents: prompt || "",
@@ -176,7 +172,18 @@ app.post("/api/run-chain-step", async (req: Request, res: Response) => {
     }
   } catch (error: any) {
     console.error("SSE Streaming Error:", error);
-    res.write(`data: ${JSON.stringify({ error: error.message || "An internal error occurred." })}\n\n`);
+    let errorMsg = error.message || "An internal error occurred.";
+    if (
+      error.status === 429 ||
+      errorMsg.includes("429") ||
+      errorMsg.includes("quota") ||
+      errorMsg.includes("quota exceeded") ||
+      errorMsg.includes("RESOURCE_EXHAUSTED") ||
+      errorMsg.includes("Too Many Requests")
+    ) {
+      errorMsg = "RESOURCE_EXHAUSTED (429): The active Gemini API quota limit has been exceeded. To bypass this instantly, create a free API Key on Google AI Studio and paste it into 'Gemini Key (Optional)' in the sidebar Settings, or wait a few moments before retrying.";
+    }
+    res.write(`data: ${JSON.stringify({ error: errorMsg })}\n\n`);
     res.end();
   }
 });
